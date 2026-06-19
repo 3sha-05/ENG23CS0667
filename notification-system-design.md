@@ -330,3 +330,204 @@ WHERE created_at < CURRENT_DATE - INTERVAL '90 days';
 - **Read notifications:** Archive after 90 days
 - **Deleted notifications:** Hard delete immediately or soft delete with flag
 - **Metadata:** Compress and archive after 180 days
+
+---
+
+# Stage 3
+
+## Query Performance Analysis & Optimization
+
+### Problem Query
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+**Current state:**
+- 50,000 students
+- 5,000,000 notifications
+- Query is slow and blocking the API
+
+---
+
+### Why Is This Query Slow?
+
+1. **No Index on WHERE clause:** 
+   - Requires full table scan of 5M rows
+   - CPU cost: O(n) where n = 5,000,000
+
+2. **SELECT * (Anti-pattern):**
+   - Unnecessary column retrieval
+   - Increases network I/O and memory usage
+   - Wider rows = fewer fit in memory cache
+
+3. **No Index on ORDER BY:**
+   - Results must be sorted after filtering
+   - Full sort on potentially large result set
+   - Cost: O(n log n) for sort operation
+
+4. **Missing composite index:**
+   - Database can't use index-based filtering + ordering
+   - Falls back to inefficient query plan
+
+**Estimated cost with current schema:**
+- Table scan: ~2-3 seconds (5M rows)
+- Sort operation: ~1-2 seconds
+- Network transfer: ~500ms - 2s (depending on result size)
+- **Total: 3.5 - 7+ seconds per request**
+
+---
+
+### Optimized Query & Solution
+
+#### Step 1: Create Composite Index
+```sql
+CREATE INDEX idx_notifications_student_unread_created 
+ON notifications(studentID, isRead, createdAt DESC)
+WHERE isRead = false;
+
+-- Partial index to reduce size
+-- Only indexes unread notifications (smaller, faster)
+-- Descending on createdAt for faster recent-first queries
+```
+
+#### Step 2: Optimized Query
+```sql
+SELECT 
+  id, 
+  title, 
+  body, 
+  type, 
+  is_read, 
+  created_at
+FROM notifications
+WHERE studentID = $1 AND isRead = false
+ORDER BY createdAt DESC
+LIMIT 20 OFFSET $2;
+```
+
+**Why this is faster:**
+- Index covers all WHERE + ORDER BY columns
+- Partial index only stores ~10-20% of data
+- Descending order matches user expectation (newest first)
+- LIMIT/OFFSET enables pagination
+- Selected columns only, no SELECT *
+
+**New estimated cost:**
+- Index lookup: ~10-50ms (binary search on indexed subset)
+- Fetch 20 rows: ~5-20ms
+- Network transfer: ~10-50ms
+- **Total: 50-120ms (30-100x faster)**
+
+---
+
+### Index Strategy: Effective or Not?
+
+**Question:** Should we index every column?
+
+**Answer: NO**
+
+**Why indexing every column is ineffective:**
+
+1. **Write Performance Penalty:**
+   - Every INSERT, UPDATE, DELETE must update ALL indexes
+   - 100 indexes = 100x slower writes
+   - Current: INSERT could take 2-5ms → becomes 200-500ms
+
+2. **Storage Overhead:**
+   - Each index = copy of data
+   - 100 indexes on 5M rows = massive storage cost
+   - Index maintenance becomes expensive
+
+3. **Query Planner Confusion:**
+   - Too many options → suboptimal plan selection
+   - More indexes = longer optimization time
+
+4. **Maintenance Burden:**
+   - Regular ANALYZE on 100 indexes
+   - VACUUM becomes slower
+   - Disk I/O increases significantly
+
+**Best Practice:** Index only columns used in:
+- WHERE clauses (filter predicates)
+- JOIN conditions
+- ORDER BY clauses
+- UNIQUE constraints
+
+---
+
+## Query: Find Students with Placement Notifications (Last 7 Days)
+
+```sql
+SELECT DISTINCT
+  studentID,
+  title,
+  body,
+  created_at
+FROM notifications
+WHERE 
+  notificationType = 'Placement'
+  AND created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+ORDER BY created_at DESC;
+```
+
+**Supporting index:**
+```sql
+CREATE INDEX idx_notifications_placement_recent
+ON notifications(notificationType, created_at DESC)
+WHERE notificationType IN ('Placement', 'Result', 'Event');
+```
+
+**Query explanation:**
+- **Enum filter:** `notificationType = 'Placement'` matches enum constraint
+- **Time range:** `created_at >= NOW() - INTERVAL '7 days'`
+- **DISTINCT:** Removes duplicate notifications per student
+- **Partial index:** Only indexes the 3 enum types, reducing size
+
+**Expected performance:**
+- Execution time: ~50-200ms (even on 5M rows)
+- Returns ~1,000-5,000 rows (students with placement in last 7 days)
+- Index size: ~50-100MB (small compared to full 5M row table)
+
+---
+
+### Index Recommendations Summary
+
+| Column(s) | Type | Rationale |
+|-----------|------|-----------|
+| `(studentID, isRead, createdAt)` | Composite | Primary query filtering + sorting |
+| `(notificationType, createdAt)` | Composite | Event type queries + recency |
+| `studentID` | Single | Foreign key join performance |
+| `createdAt` | Single | Archive/retention queries |
+
+**Total indexes: 4** (not 100)
+**Total overhead: ~10-15% of table size**
+**Write performance impact: ~5-10%** (acceptable for read-heavy workload)
+
+---
+
+## Monitoring & Future Optimization
+
+1. **Enable slow query log:**
+   ```sql
+   SET log_min_duration_statement = 1000; -- queries > 1 second
+   ```
+
+2. **Use EXPLAIN ANALYZE:**
+   ```sql
+   EXPLAIN ANALYZE
+   SELECT * FROM notifications
+   WHERE studentID = 1042 AND isRead = false
+   ORDER BY createdAt DESC;
+   ```
+
+3. **Set up query monitoring:**
+   - pg_stat_statements extension
+   - DataGrip query analyzer
+   - New Relic / DataDog APM
+
+4. **Scale when needed:**
+   - Read replicas for API reads
+   - Connection pooling (PgBouncer)
+   - Caching layer (Redis) for top 10% of students

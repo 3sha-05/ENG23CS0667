@@ -531,3 +531,304 @@ WHERE notificationType IN ('Placement', 'Result', 'Event');
    - Read replicas for API reads
    - Connection pooling (PgBouncer)
    - Caching layer (Redis) for top 10% of students
+
+---
+
+# Stage 4
+
+## Caching Strategy for High-Traffic Notification Fetches
+
+### Problem Statement
+
+**Current scenario:**
+- 50,000 students fetching notifications on every page load
+- Each student hits the database with: `SELECT * FROM notifications WHERE studentID = ? AND isRead = false`
+- Peak traffic: 50,000 students × 5-10 page loads/day = **250K-500K requests/day**
+- Even with optimized indexes, **this overwhelms the database**
+
+**Symptoms of overload:**
+- Database CPU at 95-100%
+- Connection pool exhausted (too many idle connections)
+- Average response time: 500ms-2 seconds
+- Cascading failures during peak hours
+- Poor user experience (slow page loads)
+
+---
+
+### Solution 1: In-Memory Caching (Redis)
+
+**Architecture:**
+```
+Client → API Server → Redis Cache → Database
+```
+
+**Implementation:**
+```python
+# Pseudocode for caching layer
+
+def get_student_notifications(student_id):
+    # Check cache first
+    cache_key = f"notifications:{student_id}"
+    cached = redis.get(cache_key)
+    
+    if cached:
+        return json.loads(cached)  # Hit! Return in ~5ms
+    
+    # Cache miss, query database
+    notifications = db.query(
+        "SELECT * FROM notifications WHERE studentID = ? AND isRead = false",
+        student_id
+    )
+    
+    # Store in cache for 5 minutes
+    redis.setex(cache_key, 300, json.dumps(notifications))
+    return notifications
+```
+
+**Cache invalidation triggers:**
+```sql
+-- When notification is marked as read
+UPDATE notifications SET isRead = true WHERE id = ?;
+PUBLISH cache_channel f"invalidate:notifications:{studentID}";
+
+-- Subscriber invalidates cache
+def on_notification_change(channel, message):
+    redis.delete(message)  -- e.g., "notifications:1042"
+```
+
+**Tradeoffs:**
+
+| Aspect | Impact |
+|--------|--------|
+| **Pros** | - Sub-5ms response time for cache hits<br>- Reduces DB load by 95%<br>- Simple to implement<br>- Can scale horizontally |
+| **Cons** | - Stale data (5-min window)<br>- Memory cost: ~5GB for 50K students<br>- Cache invalidation complexity<br>- Network round-trip to Redis (~1ms) |
+| **Cost** | ~$200/month for Redis cluster (16GB) |
+| **Best for** | High read volume, tolerable staleness |
+
+---
+
+### Solution 2: HTTP-Level Caching (ETags & Cache-Control)
+
+**Implementation:**
+```javascript
+// Backend API
+app.get('/api/notifications', (req, res) => {
+  const studentId = req.user.id;
+  const data = getNotifications(studentId);
+  
+  // Generate ETag (hash of response)
+  const etag = crypto.createHash('md5')
+    .update(JSON.stringify(data))
+    .digest('hex');
+  
+  res.set('ETag', `"${etag}"`);
+  res.set('Cache-Control', 'private, max-age=300'); // 5 minutes
+  res.set('Last-Modified', new Date().toUTCString());
+  
+  // Client sends If-None-Match header on next request
+  if (req.get('If-None-Match') === `"${etag}"`) {
+    return res.status(304).send(); // Not Modified
+  }
+  
+  return res.json(data);
+});
+```
+
+**Browser caching headers:**
+```
+Cache-Control: private, max-age=300, must-revalidate
+ETag: "abc123def456"
+Last-Modified: Wed, 19 Jun 2026 10:00:00 GMT
+```
+
+**Tradeoffs:**
+
+| Aspect | Impact |
+|--------|--------|
+| **Pros** | - Browser caches responses<br>- Reduces network bandwidth by 70%<br>- 304 Not Modified = ~100ms vs 1-2s<br>- No server-side cache needed |
+| **Cons** | - Still hits API on every page load<br>- ETag validation takes time<br>- Doesn't work for offline scenarios<br>- Client-dependent (browser/mobile) |
+| **Cost** | Zero (native HTTP feature) |
+| **Best for** | Bandwidth reduction, moderate staleness tolerance |
+
+---
+
+### Solution 3: Content Delivery Network (CDN)
+
+**Architecture:**
+```
+Student → CDN Edge (Los Angeles) → Origin Server → Database
+```
+
+**Benefits:**
+- Requests served from nearest geographic location
+- Response time: 50-100ms (vs 500ms from distant server)
+- Automatic cache purging via versioning
+
+**Implementation (Cloudflare example):**
+```
+Cache Key: /api/notifications?studentId=1042
+Cache TTL: 5 minutes
+Purge on: New notification event
+```
+
+**Tradeoffs:**
+
+| Aspect | Impact |
+|--------|--------|
+| **Pros** | - Reduces latency by 80%<br>- Global distribution<br>- DDoS protection<br>- Reduces origin bandwidth |
+| **Cons** | - Expensive ($200-1000/month)<br>- All students share same cache<br>- Privacy concerns (CDN sees data)<br>- Complex cache purging rules |
+| **Cost** | ~$500/month for global CDN |
+| **Best for** | Public data or non-sensitive content |
+
+⚠️ **Not recommended for notifications** (student-specific data, privacy).
+
+---
+
+### Solution 4: WebSocket + Server Push (Real-time Updates)
+
+**Architecture:**
+```
+Client ← → Server (WebSocket)
+         ↓
+      Database
+```
+
+**Implementation:**
+```javascript
+// Backend - establish WebSocket connection
+const WebSocket = require('ws');
+const wss = new WebSocket.Server({ port: 8080 });
+
+wss.on('connection', (ws, req) => {
+  const studentId = extractStudentId(req);
+  
+  // Subscribe to student's notification channel
+  pubsub.subscribe(`notifications:${studentId}`, (message) => {
+    ws.send(JSON.stringify({
+      event: 'notification.new',
+      data: message
+    }));
+  });
+  
+  ws.on('close', () => {
+    pubsub.unsubscribe(`notifications:${studentId}`);
+  });
+});
+
+// Client - receive notifications
+const ws = new WebSocket('wss://api.example.com/ws');
+
+ws.onmessage = (event) => {
+  const {event, data} = JSON.parse(event.data);
+  
+  if (event === 'notification.new') {
+    updateUI(data); // Real-time update
+  }
+};
+```
+
+**Tradeoffs:**
+
+| Aspect | Impact |
+|--------|--------|
+| **Pros** | - Real-time updates (instant)<br>- No polling needed<br>- Reduces API calls to near zero<br>- Better UX (notifications appear immediately) |
+| **Cons** | - Higher server resource usage<br>- Connection management complexity<br>- Mobile battery drain (always connected)<br>- Fallback to polling needed |
+| **Cost** | ~$300/month for WebSocket infrastructure |
+| **Best for** | Real-time notifications, engagement-critical apps |
+
+---
+
+### Solution 5: Hybrid Approach (Recommended)
+
+**Combine multiple strategies:**
+
+```
+┌─ Browser Cache (HTTP Cache-Control)
+├─ Redis Cache (in-memory, 5-min TTL)
+├─ WebSocket (real-time updates)
+└─ Database (indexed, optimized queries)
+```
+
+**Recommended Architecture:**
+
+1. **Initial page load:**
+   - Fetch from cache layer (Redis)
+   - If miss, query DB with optimized index
+   - Return with Cache-Control headers
+   - Time: 50-200ms
+
+2. **Subsequent page loads (same session):**
+   - Browser cache serves from disk
+   - Validation via ETag (304 Not Modified)
+   - Time: 20-50ms
+
+3. **Real-time updates:**
+   - WebSocket connection established on login
+   - New notifications pushed instantly
+   - No polling needed
+
+4. **Cache invalidation:**
+   - Event-driven (new notification → publish event)
+   - TTL-based (5 minutes max)
+   - Manual purge for admin operations
+
+**Performance comparison:**
+
+| Strategy | Response Time | DB Load | Cost | Staleness |
+|----------|---------------|---------|------|-----------|
+| **No caching** | 500-2000ms | 100% | $0 | 0 min |
+| **Redis only** | 5-50ms | 5% | $200 | 5 min |
+| **HTTP cache only** | 100-500ms | 80% | $0 | 5 min |
+| **WebSocket only** | 0-100ms | 20% | $300 | 0 sec |
+| **Hybrid** | 5-100ms | 2% | $500 | 0-5 min |
+
+---
+
+### Implementation Roadmap
+
+**Phase 1 (Week 1-2):**
+- Add Redis cache layer
+- Implement cache invalidation via pub/sub
+- Expected improvement: 5-10x faster, 80% fewer DB queries
+
+**Phase 2 (Week 3-4):**
+- Add HTTP Cache-Control headers
+- Implement ETag validation
+- Expected improvement: Additional 5% DB load reduction
+
+**Phase 3 (Week 5-6):**
+- Implement WebSocket connection
+- Real-time notification delivery
+- Expected improvement: Instant updates, near-zero polling
+
+**Phase 4 (Week 7-8):**
+- Load testing and optimization
+- Monitor cache hit rates
+- Fine-tune TTLs and strategies
+
+---
+
+### Monitoring & Metrics
+
+```sql
+-- Cache hit rate (should be > 80%)
+SELECT COUNT(*) as cache_hits FROM metrics WHERE cache_status = 'HIT';
+SELECT COUNT(*) as total_requests FROM metrics;
+-- Hit rate = cache_hits / total_requests
+
+-- Database query reduction
+SELECT COUNT(*) as db_queries FROM metrics WHERE source = 'database';
+-- Should be < 20% of total requests with caching
+```
+
+---
+
+### Cost-Benefit Summary
+
+| Strategy | Cost | Effort | Benefit | Recommended |
+|----------|------|--------|---------|-------------|
+| Redis Caching | $200/mo | Medium | **Excellent** | ✅ Yes |
+| HTTP Cache | $0 | Low | **Good** | ✅ Yes |
+| CDN | $500/mo | Medium | **Fair** (privacy concern) | ❌ No |
+| WebSocket | $300/mo | High | **Excellent** | ✅ Yes (phase 2) |
+| **Hybrid Total** | **$500/mo** | **High** | **95% improvement** | ✅ **Recommended** |
